@@ -335,11 +335,23 @@ app.post('/analyze', async (req, res) => {
 
     try {
         // 將前端傳來的 base64 圖片轉發給 Python AI 服務進行辨識
-        const aiResponse = await axios.post(PYTHON_AI_URL, { image, userId }, { timeout: 5000 });
-        const { label, distance } = aiResponse.data;
+        // 注意：Python 端(YOLO+SegFormer)回傳的是 { objects: [...], analysis: [{object, distance, ratio}, ...] }
+        // 而非單一 label/distance，這裡取 ratio 最大（最近）的物體作為代表性警示對象
+        const aiResponse = await axios.post(PYTHON_AI_URL, { image, userId }, { timeout: 30000 });
+        const { analysis } = aiResponse.data;
 
-        // 回傳辨識結果，前端依 label/distance 對照字典並使用 Expo-Speech 播報
-        res.status(200).json({ success: true, label, distance });
+        if (!analysis || analysis.length === 0) {
+            return res.status(200).json({ success: true, label: null, distance: null });
+        }
+
+        const closest = analysis.reduce((a, b) => (b.ratio > a.ratio ? b : a));
+        // Python 的 distance 是「近 (Immediate)/中 (Medium)/遠 (Far)」字串，這裡取開頭中文字判斷等級
+        const distance = closest.distance.startsWith('近') ? 'near'
+            : closest.distance.startsWith('中') ? 'medium'
+            : 'far';
+
+        // label 直接使用 Python 已翻譯好的中文物體名稱（如「汽車」「人」），前端不需再對照字典
+        res.status(200).json({ success: true, label: closest.object, distance });
     } catch (err) {
         console.error('[AI 辨識錯誤]', err.message);
         res.status(502).json({ success: false, message: "AI 辨識服務無法使用", label: null });
