@@ -273,6 +273,10 @@ function pickClosest(analysis) {
     });
 }
 
+// 紅綠燈是號誌狀態、不是「離使用者多近的障礙物」，不能跟其他物體一起比距離，
+// 所以要先從 analysis 裡把它獨立出來，剩下的物體才拿去比最近
+const TRAFFIC_LIGHT_LABELS = new Set(['紅燈', '綠燈']);
+
 app.post('/analyze', async (req, res) => {
     const { image, userId } = req.body;
 
@@ -288,19 +292,33 @@ app.post('/analyze', async (req, res) => {
         const { analysis } = aiResponse.data;
 
         if (!analysis || analysis.length === 0) {
-            return res.status(200).json({ success: true, label: null, distance: null, distance_m: null });
+            return res.status(200).json({ success: true, label: null, distance: null, distance_m: null, trafficLight: null });
         }
 
-        const closest = pickClosest(analysis);
+        const trafficLightItem = analysis.find((item) => TRAFFIC_LIGHT_LABELS.has(item.object));
+        const otherItems = analysis.filter((item) => !TRAFFIC_LIGHT_LABELS.has(item.object));
 
-        // Python 的 distance 是「近 (Immediate)/中 (Medium)/遠 (Far)」字串，這裡取開頭中文字判斷等級
-        const distance = closest.distance.startsWith('近') ? 'near'
-            : closest.distance.startsWith('中') ? 'medium'
-            : 'far';
+        let label = null, distance = null, distance_m = null;
+        if (otherItems.length > 0) {
+            const closest = pickClosest(otherItems);
+            // Python 的 distance 是「近 (Immediate)/中 (Medium)/遠 (Far)」字串，這裡取開頭中文字判斷等級
+            distance = closest.distance.startsWith('近') ? 'near'
+                : closest.distance.startsWith('中') ? 'medium'
+                : 'far';
+            // label 直接使用 Python 已翻譯好的中文物體名稱（如「車」「行人」），前端不需再對照字典
+            // distance_m 可能是 null（該類別沒有真實尺寸對照表），前端要處理沒有公尺數的情況
+            label = closest.object;
+            distance_m = closest.distance_m;
+        }
 
-        // label 直接使用 Python 已翻譯好的中文物體名稱（如「汽車」「人」），前端不需再對照字典
-        // distance_m 可能是 null（該類別沒有真實尺寸對照表），前端要處理沒有公尺數的情況
-        res.status(200).json({ success: true, label: closest.object, distance, distance_m: closest.distance_m });
+        // 有紅綠燈就一定回傳，不分遠近、不用跟其他物體搶播報名額
+        res.status(200).json({
+            success: true,
+            label,
+            distance,
+            distance_m,
+            trafficLight: trafficLightItem ? trafficLightItem.object : null,
+        });
     } catch (err) {
         console.error('[AI 辨識錯誤]', err.message);
         res.status(502).json({ success: false, message: "AI 辨識服務無法使用", label: null });
