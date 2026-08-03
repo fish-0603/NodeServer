@@ -1,5 +1,6 @@
 -- SmartGuide 資料庫完整結構
--- 從目前正在使用的 App 資料庫 dump 出來，包含兩個 migrations 的異動
+-- 從目前正在使用的 App 資料庫 dump 出來，包含四個 migrations 的異動
+-- （001 新增 Google 登入欄位、002 補上 CASCADE 刪除規則、003 新增 auth_tokens、004 刪除未使用的 alert_logs）
 --
 -- 下載這個 repo 的人可以這樣建立一模一樣的資料庫：
 --
@@ -11,23 +12,11 @@
 -- 之後有新的欄位異動，請在 migrations/ 資料夾新增一支新的 SQL 檔案，
 -- 不要直接改這份檔案（這份是「初始建置用」，不是持續維護的 migration）。
 
-CREATE TABLE public.alert_logs (
-    id integer NOT NULL,
-    alert_time timestamp without time zone DEFAULT CURRENT_TIMESTAMP,
-    alert_text text,
-    source_type character varying(20),
-    gps_location text
+CREATE TABLE public.auth_tokens (
+    token text NOT NULL,
+    user_id integer NOT NULL,
+    created_at timestamp without time zone DEFAULT now() NOT NULL
 );
-
-CREATE SEQUENCE public.alert_logs_id_seq
-    AS integer
-    START WITH 1
-    INCREMENT BY 1
-    NO MINVALUE
-    NO MAXVALUE
-    CACHE 1;
-
-ALTER SEQUENCE public.alert_logs_id_seq OWNED BY public.alert_logs.id;
 
 CREATE TABLE public.connections (
     id integer NOT NULL,
@@ -128,15 +117,14 @@ CREATE SEQUENCE public.vision_logs_id_seq
 
 ALTER SEQUENCE public.vision_logs_id_seq OWNED BY public.vision_logs.id;
 
-ALTER TABLE ONLY public.alert_logs ALTER COLUMN id SET DEFAULT nextval('public.alert_logs_id_seq'::regclass);
 ALTER TABLE ONLY public.connections ALTER COLUMN id SET DEFAULT nextval('public.connections_id_seq'::regclass);
 ALTER TABLE ONLY public.hardware_logs ALTER COLUMN id SET DEFAULT nextval('public.hardware_logs_id_seq'::regclass);
 ALTER TABLE ONLY public.sos_events ALTER COLUMN id SET DEFAULT nextval('public.sos_events_id_seq'::regclass);
 ALTER TABLE ONLY public.users ALTER COLUMN user_id SET DEFAULT nextval('public.users_user_id_seq'::regclass);
 ALTER TABLE ONLY public.vision_logs ALTER COLUMN id SET DEFAULT nextval('public.vision_logs_id_seq'::regclass);
 
-ALTER TABLE ONLY public.alert_logs
-    ADD CONSTRAINT alert_logs_pkey PRIMARY KEY (id);
+ALTER TABLE ONLY public.auth_tokens
+    ADD CONSTRAINT auth_tokens_pkey PRIMARY KEY (token);
 
 ALTER TABLE ONLY public.connections
     ADD CONSTRAINT connections_blind_id_caregiver_id_key UNIQUE (blind_id, caregiver_id);
@@ -161,6 +149,11 @@ ALTER TABLE ONLY public.users
 
 ALTER TABLE ONLY public.vision_logs
     ADD CONSTRAINT vision_logs_pkey PRIMARY KEY (id);
+
+CREATE INDEX auth_tokens_user_id_idx ON public.auth_tokens USING btree (user_id);
+
+ALTER TABLE ONLY public.auth_tokens
+    ADD CONSTRAINT auth_tokens_user_id_fkey FOREIGN KEY (user_id) REFERENCES public.users(user_id) ON DELETE CASCADE;
 
 ALTER TABLE ONLY public.connections
     ADD CONSTRAINT connections_blind_id_fkey FOREIGN KEY (blind_id) REFERENCES public.users(user_id) ON DELETE CASCADE;
