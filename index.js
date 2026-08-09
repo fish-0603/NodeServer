@@ -393,43 +393,12 @@ app.get('/sos-history/:userId', requireAuth, requireSelf('userId', 'params'), as
 });
 
 // ==========================================
-// 4. AI 辨識決策輔助與硬體資料接收
-// ==========================================
-
-// ESP32 硬體資料接收端點：接收距離與傾斜角度數據並寫入資料庫
-app.post('/api/hardware', async (req, res) => {
-    const { distance, tilt } = req.body;
-    const time = new Date().toLocaleTimeString();
-
-    if (distance === undefined || tilt === undefined) {
-        return res.status(400).json({
-            status: "error",
-            message: "缺少必要數據" });
-    }
-    console.log(`[${time}] [硬體接收] 收到距離: ${distance}cm, 傾斜數據: ${tilt}`);
-
-    try {
-        await db.query('INSERT INTO hardware_logs(distance, tilt_angle) VALUES($1, $2)', [distance, tilt]);
-        console.log(`[${time}] [硬體成功] 距離: ${distance}cm`);
-        res.status(200).json({
-            status: "success",
-            message: "存檔成功"
-        });
-    } catch (err) {
-        console.error('[DB Error]', err.message);
-        res.status(500).json({
-            status: "error",
-            message: "資料庫寫入失敗"
-        });
-    }
-});
-
-// ==========================================
-// 5. 前端即時影像辨識：接收截圖，轉發給 Python 辨識後回傳結果
+// 4. 前端即時影像辨識：接收截圖，轉發給 Python 辨識後回傳結果
 // ==========================================
 
 // 從 Python 回傳的 analysis 陣列中挑出最該優先警示的一個物體：
-// 先比「近/中/遠」等級，同等級時優先比實際公尺數（distance_m 較準），沒有公尺數的類別才退回比面積比例（ratio）
+// 先比「近/中/遠」等級，同等級時優先比實際公尺數（distance_m 較準），沒有公尺數的類別才退回比面積比例（ratio）。
+// 不篩掉「遠」距離的物體——YOLO 常常因為物體偏遠而信心值不夠，乾脆不篩距離，有偵測到就有機會播
 function pickClosest(analysis) {
     const getRank = (item) => item.distance.startsWith('近') ? 0 : item.distance.startsWith('中') ? 1 : 2;
     return analysis.reduce((a, b) => {
@@ -472,9 +441,9 @@ app.post('/analyze', requireAuth, async (req, res) => {
     try {
         // 將前端傳來的 base64 圖片轉發給 Python AI 服務進行辨識
         // 注意：Python 端(YOLO+SegFormer)回傳的是 { objects: [...], analysis: [{object, distance, distance_m, ratio, zone}, ...],
-        // walkableScores: {left, middle, right}, crosswalkDetected, skyDominant }
+        // walkableScores: {left, middle, right}, crosswalkInMiddle, skyDominant }
         const aiResponse = await axios.post(PYTHON_AI_URL, { image, userId }, { timeout: 30000 });
-        const { analysis, walkableScores, crosswalkDetected, skyDominant, sidewalkDirection } = aiResponse.data;
+        const { analysis, walkableScores, crosswalkInMiddle, skyDominant, sidewalkDirection } = aiResponse.data;
 
         if (!analysis || analysis.length === 0) {
             return res.status(200).json({
@@ -483,7 +452,9 @@ app.post('/analyze', requireAuth, async (req, res) => {
                 zone: null,
                 recommendedZone: walkableScores ? pickRecommendedZone(walkableScores, null) : null,
                 trafficLight: null,
-                crosswalkDetected: !!crosswalkDetected,
+                crosswalkInMiddle: !!crosswalkInMiddle,
+                // 沒有偵測到任何物體，斑馬線上自然也不會有障礙物
+                crosswalkObstacle: null,
                 skyDominant: !!skyDominant,
                 // 沒有 YOLO 物體時才用人行道方向建議佔用第一段播報名額，避免同時念兩件事
                 terrainMessage: buildTerrainMessage(sidewalkDirection),
@@ -505,6 +476,13 @@ app.post('/analyze', requireAuth, async (req, res) => {
         // 建議行走方向：排除掉障礙物所在區，從剩下的區域挑可行走分數最高的一區
         const recommendedZone = walkableScores ? pickRecommendedZone(walkableScores, zone) : null;
 
+        // 斑馬線上是否有障礙物、是哪一個：簡化判斷，中間區同時偵測到斑馬線、又有物體落在
+        // 中間區就算，多個候選時沿用「離鏡頭最近優先」規則只挑一個
+        const middleZoneItems = otherItems.filter((item) => item.zone === 'middle');
+        const crosswalkObstacle = crosswalkInMiddle && middleZoneItems.length > 0
+            ? pickClosest(middleZoneItems).object
+            : null;
+
         // 有紅綠燈就一定回傳，不分遠近、不用跟其他物體搶播報名額
         res.status(200).json({
             success: true,
@@ -512,7 +490,8 @@ app.post('/analyze', requireAuth, async (req, res) => {
             zone,
             recommendedZone,
             trafficLight: trafficLightItem ? trafficLightItem.object : null,
-            crosswalkDetected: !!crosswalkDetected,
+            crosswalkInMiddle: !!crosswalkInMiddle,
+            crosswalkObstacle,
             skyDominant: !!skyDominant,
             // 已經有 YOLO 物體時不再疊加人行道方向建議，避免同一段播報塞太多資訊
             terrainMessage: label ? null : buildTerrainMessage(sidewalkDirection),

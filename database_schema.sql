@@ -1,6 +1,7 @@
 -- SmartGuide 資料庫完整結構
--- 從目前正在使用的 App 資料庫 dump 出來，包含四個 migrations 的異動
--- （001 新增 Google 登入欄位、002 補上 CASCADE 刪除規則、003 新增 auth_tokens、004 刪除未使用的 alert_logs）
+-- 從目前正在使用的 App 資料庫 dump 出來，包含五個 migrations 的異動
+-- （001 新增 Google 登入欄位、002 補上 CASCADE 刪除規則、003 新增 auth_tokens、
+-- 　004 刪除未使用的 alert_logs、005 刪除未使用的 hardware_logs）
 --
 -- 下載這個 repo 的人可以這樣建立一模一樣的資料庫：
 --
@@ -37,23 +38,6 @@ CREATE SEQUENCE public.connections_id_seq
     CACHE 1;
 
 ALTER SEQUENCE public.connections_id_seq OWNED BY public.connections.id;
-
-CREATE TABLE public.hardware_logs (
-    id integer NOT NULL,
-    log_time timestamp without time zone DEFAULT CURRENT_TIMESTAMP,
-    distance double precision,
-    tilt_angle double precision
-);
-
-CREATE SEQUENCE public.hardware_logs_id_seq
-    AS integer
-    START WITH 1
-    INCREMENT BY 1
-    NO MINVALUE
-    NO MAXVALUE
-    CACHE 1;
-
-ALTER SEQUENCE public.hardware_logs_id_seq OWNED BY public.hardware_logs.id;
 
 CREATE TABLE public.sos_events (
     id integer NOT NULL,
@@ -118,7 +102,6 @@ CREATE SEQUENCE public.vision_logs_id_seq
 ALTER SEQUENCE public.vision_logs_id_seq OWNED BY public.vision_logs.id;
 
 ALTER TABLE ONLY public.connections ALTER COLUMN id SET DEFAULT nextval('public.connections_id_seq'::regclass);
-ALTER TABLE ONLY public.hardware_logs ALTER COLUMN id SET DEFAULT nextval('public.hardware_logs_id_seq'::regclass);
 ALTER TABLE ONLY public.sos_events ALTER COLUMN id SET DEFAULT nextval('public.sos_events_id_seq'::regclass);
 ALTER TABLE ONLY public.users ALTER COLUMN user_id SET DEFAULT nextval('public.users_user_id_seq'::regclass);
 ALTER TABLE ONLY public.vision_logs ALTER COLUMN id SET DEFAULT nextval('public.vision_logs_id_seq'::regclass);
@@ -131,9 +114,6 @@ ALTER TABLE ONLY public.connections
 
 ALTER TABLE ONLY public.connections
     ADD CONSTRAINT connections_pkey PRIMARY KEY (id);
-
-ALTER TABLE ONLY public.hardware_logs
-    ADD CONSTRAINT hardware_logs_pkey PRIMARY KEY (id);
 
 ALTER TABLE ONLY public.sos_events
     ADD CONSTRAINT sos_events_pkey PRIMARY KEY (id);
