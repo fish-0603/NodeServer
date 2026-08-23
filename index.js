@@ -7,6 +7,7 @@ const axios = require('axios'); // 用於呼叫 Python AI 辨識服務
 const { OAuth2Client } = require('google-auth-library');
 
 const db = require('./db'); // 資料庫連線模組
+const { sendPushToTokens } = require('./fcm'); // Firebase 推播（SOS 通知照護者用）
 
 const app = express();
 const PORT = process.env.PORT || 3000; // 優先使用環境變數指定的埠號，未設定則預設 3000
@@ -345,6 +346,30 @@ app.post('/set-emergency', requireAuth, requireSelf('blindId'), async (req, res)
 // ==========================================
 // 3. SOS 警報與歷史紀錄模組
 // ==========================================
+
+// 查詢視障者目前已綁定（accepted）的照護者 fcm_token 並推播；在 /sos 回應之後才呼叫（不 await），
+// 避免推播的網路來回拖慢撥打緊急電話的動作，失敗只記 log 不影響 SOS 本身
+async function notifyCaregiversOfSos(blindUserId) {
+  const caregiverRes = await db.query(
+    `SELECT u.fcm_token
+     FROM connections c
+     JOIN users u ON u.user_id = c.caregiver_id
+     WHERE c.blind_id = $1 AND c.status = 'accepted' AND u.fcm_token IS NOT NULL`,
+    [blindUserId]
+  );
+  const tokens = caregiverRes.rows.map((r) => r.fcm_token).filter(Boolean);
+  if (tokens.length === 0) return;
+
+  const nameRes = await db.query('SELECT full_name FROM users WHERE user_id = $1', [blindUserId]);
+  const blindName = nameRes.rows[0]?.full_name || '使用者';
+
+  await sendPushToTokens(
+    tokens,
+    { title: '🚨 緊急求助通知', body: `${blindName} 已觸發緊急求助，請盡速確認狀況` },
+    { type: 'SOS', userId: String(blindUserId) },
+  );
+}
+
 app.post('/sos', requireAuth, requireSelf('userId'), async (req, res) => {
   const { userId, latitude, longitude, eventType } = req.body;
   try {
@@ -367,9 +392,27 @@ app.post('/sos', requireAuth, requireSelf('userId'), async (req, res) => {
     const emergencyPhone = contactRes.rows.length > 0 ? contactRes.rows[0].phone : null;
 
     res.json({ success: true, emergencyPhone });
+
+    notifyCaregiversOfSos(userId).catch((err) =>
+      console.error('[SOS 推播] 通知照護者失敗:', err.message)
+    );
   } catch (err) {
     console.error(err);
     res.status(500).json({ success: false, message: "伺服器錯誤" });
+  }
+});
+
+// App 登入成功、或每次啟動取得新的 FCM token 時呼叫，把 token 存進 users 表，
+// /sos 觸發時才找得到這個使用者的裝置該送去哪裡
+app.post('/push-token', requireAuth, async (req, res) => {
+  const { fcmToken } = req.body;
+  if (!fcmToken) return res.status(400).json({ success: false, message: '缺少 fcmToken' });
+  try {
+    await db.query('UPDATE users SET fcm_token = $1 WHERE user_id = $2', [fcmToken, req.authUserId]);
+    res.json({ success: true });
+  } catch (err) {
+    console.error('Push Token Error:', err.message);
+    res.status(500).json({ success: false, message: '伺服器錯誤' });
   }
 });
 
@@ -431,8 +474,25 @@ function buildTerrainMessage(sidewalkDirection) {
     return `${zh}有人行道，建議往${zh}移動`;
 }
 
+// 斑馬線「前方確認」需要連續命中才算數：SegFormer 是逐幀獨立推論，沒有時序穩定性，
+// 單一幀的雜訊（反光、遮擋、拍攝角度）就可能讓某一幀誤判有/沒有斑馬線。
+// App 端每 5 秒呼叫一次 /analyze，這裡用登入者 id 追蹤連續命中次數；只要斷一次就整個歸零，
+// 不是容錯的滑動視窗，要重新累積滿才會再次判定「前方確定有斑馬線」
+const CROSSWALK_CONFIRM_STREAK = 3; // 約 6 秒（App 端 2 秒拍一次 * 3）持續偵測到才算數
+const crosswalkStreaks = new Map(); // userId -> 目前連續命中次數
+
+function updateCrosswalkStreak(userId, crosswalkAhead) {
+    const streak = crosswalkAhead ? (crosswalkStreaks.get(userId) || 0) + 1 : 0;
+    crosswalkStreaks.set(userId, streak);
+    return streak >= CROSSWALK_CONFIRM_STREAK;
+}
+
 app.post('/analyze', requireAuth, async (req, res) => {
-    const { image, userId } = req.body;
+    // frameId/captureTime 只是原樣轉發給 Python 用來在 log 裡標記「這是哪一張照片」，
+    // 方便事後對照除錯，App 端自己算辨識結果會不會過期用的是本地時間，不依賴這裡的回傳值
+    const { image, frameId, captureTime } = req.body;
+    // 用已驗證的登入者 id（不是 client 帶的 body.userId），斑馬線連續 frame 計數才不會被亂帶的 userId 污染
+    const userId = req.authUserId;
 
     if (!image) {
         return res.status(400).json({ success: false, message: "未接收到影像數據" });
@@ -440,10 +500,15 @@ app.post('/analyze', requireAuth, async (req, res) => {
 
     try {
         // 將前端傳來的 base64 圖片轉發給 Python AI 服務進行辨識
-        // 注意：Python 端(YOLO+SegFormer)回傳的是 { objects: [...], analysis: [{object, distance, distance_m, ratio, zone}, ...],
-        // walkableScores: {left, middle, right}, crosswalkInMiddle, skyDominant }
-        const aiResponse = await axios.post(PYTHON_AI_URL, { image, userId }, { timeout: 30000 });
-        const { analysis, walkableScores, crosswalkInMiddle, skyDominant, sidewalkDirection } = aiResponse.data;
+        // 注意：Python 端(YOLO+SegFormer)回傳的是 { objects: [...], analysis: [{object, distance, distance_m, ratio, zone, onCrosswalk}, ...],
+        // walkableScores: {left, middle, right}, crosswalkAhead, terrainDetected, isBlackFrame }
+        const aiResponse = await axios.post(PYTHON_AI_URL, { image, userId, frameId, captureTime }, { timeout: 30000 });
+        const { analysis, walkableScores, crosswalkAhead, terrainDetected, isBlackFrame, sidewalkDirection } = aiResponse.data;
+
+        // 斑馬線流程：SegFormer 判斷前方 ROI 有足夠面積的斑馬線 → 連續數個 frame 都存在才確認
+        // →（前面的物體偵測結果裡）找行人號誌 → 有燈號就照燈號提示通行/等待，沒有燈號才看
+        // 斑馬線面積上有沒有障礙物。crosswalkConfirmed 就是這條流程「已確認前方有斑馬線」的開關
+        const crosswalkConfirmed = updateCrosswalkStreak(userId, !!crosswalkAhead);
 
         if (!analysis || analysis.length === 0) {
             return res.status(200).json({
@@ -452,10 +517,11 @@ app.post('/analyze', requireAuth, async (req, res) => {
                 zone: null,
                 recommendedZone: walkableScores ? pickRecommendedZone(walkableScores, null) : null,
                 trafficLight: null,
-                crosswalkInMiddle: !!crosswalkInMiddle,
+                crosswalkInMiddle: crosswalkConfirmed,
                 // 沒有偵測到任何物體，斑馬線上自然也不會有障礙物
                 crosswalkObstacle: null,
-                skyDominant: !!skyDominant,
+                terrainDetected: !!terrainDetected,
+                isBlackFrame: !!isBlackFrame,
                 // 沒有 YOLO 物體時才用人行道方向建議佔用第一段播報名額，避免同時念兩件事
                 terrainMessage: buildTerrainMessage(sidewalkDirection),
             });
@@ -476,50 +542,32 @@ app.post('/analyze', requireAuth, async (req, res) => {
         // 建議行走方向：排除掉障礙物所在區，從剩下的區域挑可行走分數最高的一區
         const recommendedZone = walkableScores ? pickRecommendedZone(walkableScores, zone) : null;
 
-        // 斑馬線上是否有障礙物、是哪一個：簡化判斷，中間區同時偵測到斑馬線、又有物體落在
-        // 中間區就算，多個候選時沿用「離鏡頭最近優先」規則只挑一個
-        const middleZoneItems = otherItems.filter((item) => item.zone === 'middle');
-        const crosswalkObstacle = crosswalkInMiddle && middleZoneItems.length > 0
-            ? pickClosest(middleZoneItems).object
+        // 斑馬線上是否有障礙物：只採信 Python 端算出跟斑馬線像素區域有實際重疊的物體（onCrosswalk），
+        // 不再用「同一個中間分區」這種粗略判斷，避免把斑馬線兩側、但其實沒踩在線上的東西也算進去。
+        // 且只有確認前方有斑馬線時才需要看這個，避免跟一般障礙物提示搶著播
+        const crosswalkObstacleItems = crosswalkConfirmed ? otherItems.filter((item) => item.onCrosswalk) : [];
+        const crosswalkObstacle = crosswalkObstacleItems.length > 0
+            ? pickClosest(crosswalkObstacleItems).object
             : null;
 
-        // 有紅綠燈就一定回傳，不分遠近、不用跟其他物體搶播報名額
         res.status(200).json({
             success: true,
             label,
             zone,
             recommendedZone,
-            trafficLight: trafficLightItem ? trafficLightItem.object : null,
-            crosswalkInMiddle: !!crosswalkInMiddle,
+            // 紅綠燈提示是「已確認前方有斑馬線」流程下的一步，還沒連續確認前不提前播報燈號，
+            // 避免跟一般障礙物提示同時搶播報名額
+            trafficLight: crosswalkConfirmed && trafficLightItem ? trafficLightItem.object : null,
+            crosswalkInMiddle: crosswalkConfirmed,
             crosswalkObstacle,
-            skyDominant: !!skyDominant,
+            terrainDetected: !!terrainDetected,
+            isBlackFrame: !!isBlackFrame,
             // 已經有 YOLO 物體時不再疊加人行道方向建議，避免同一段播報塞太多資訊
             terrainMessage: label ? null : buildTerrainMessage(sidewalkDirection),
         });
     } catch (err) {
         console.error('[AI 辨識錯誤]', err.message);
         res.status(502).json({ success: false, message: "AI 辨識服務無法使用", label: null });
-    }
-});
-
-// Python AI 服務非同步回傳的辨識結果備份端點，對應 apiserver2.py 的 MEMBER_API_URL
-app.post('/api/result', async (req, res) => {
-    const { objects, analysis } = req.body;
-    console.log(`[AI 結果備份] 收到來自 Python 的辨識結果，物件: ${JSON.stringify(objects)}`);
-
-    try {
-        if (analysis && analysis.length > 0) {
-            // 只存 Node 篩選出的最近/最優先物體，與 /analyze 播報給使用者的對象一致，避免資料庫存入使用者根本沒聽到的次要物體
-            const closest = pickClosest(analysis);
-            await db.query(
-                'INSERT INTO vision_logs(obstacle_type, distance_cm) VALUES($1, $2)',
-                [closest.object, closest.distance_m != null ? Math.round(closest.distance_m * 100) : null]
-            );
-        }
-        res.status(200).json({ success: true });
-    } catch (err) {
-        console.error('[AI 結果備份寫入失敗]', err.message);
-        res.status(500).json({ success: false });
     }
 });
 
