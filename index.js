@@ -8,6 +8,7 @@ const { OAuth2Client } = require('google-auth-library');
 
 const db = require('./db'); // 資料庫連線模組
 const { sendPushToTokens } = require('./fcm'); // Firebase 推播（SOS 通知照護者用）
+const { sendVerificationEmail } = require('./mailer'); // 寄送 email 驗證碼
 
 const app = express();
 const PORT = process.env.PORT || 3000; // 優先使用環境變數指定的埠號，未設定則預設 3000
@@ -38,6 +39,26 @@ async function issueToken(userId) {
   const token = crypto.randomBytes(32).toString('hex');
   await db.query('INSERT INTO auth_tokens (token, user_id) VALUES ($1, $2)', [token, userId]);
   return token;
+}
+
+// 產生 6 碼驗證碼寫入 email_verification_codes，並非同步寄出驗證信。
+// 寄信失敗只記 log、不拋例外——不該讓寄信服務的問題擋到註冊/改信箱本身的流程
+// （做法同 notifyCaregiversOfSos：主流程不 await 寄信這一步）
+const EMAIL_VERIFICATION_TTL_MS = 15 * 60 * 1000; // 15 分鐘
+
+// 回傳 expiresAt，讓呼叫端可以把過期時間一起回給前端顯示倒數計時
+async function issueEmailVerificationCode(userId, email) {
+  await db.query('DELETE FROM email_verification_codes WHERE user_id = $1', [userId]);
+  const code = crypto.randomInt(100000, 1000000).toString();
+  const expiresAt = new Date(Date.now() + EMAIL_VERIFICATION_TTL_MS);
+  await db.query(
+    'INSERT INTO email_verification_codes (user_id, email, code, expires_at) VALUES ($1, $2, $3, $4)',
+    [userId, email, code, expiresAt]
+  );
+  sendVerificationEmail(email, code).catch((err) =>
+    console.error('[Email 驗證] 寄送驗證信失敗:', err.message)
+  );
+  return expiresAt;
 }
 
 // 中介層：驗證 Authorization: Bearer <token>，通過後把使用者 id 掛在 req.authUserId 上
@@ -82,11 +103,17 @@ app.get('/', (_req, res) => {
     });
 });
 
+// 前端已經檢查過一次，這裡是防止有人繞過 App 直接打 API 送出格式不對的 email
+const EMAIL_FORMAT_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+
 // ==========================================
 // 1. 認證模組
 // ==========================================
 app.post('/register', async (req, res) => {
   const { full_name, username, email, password, role, phone } = req.body;
+  if (email && !EMAIL_FORMAT_REGEX.test(email)) {
+    return res.status(400).json({ success: false, message: "電子郵件格式錯誤" });
+  }
   try {
     const userCheck = await db.query('SELECT * FROM users WHERE username = $1', [username]);
     if (userCheck.rows.length > 0) return res.status(400).json({ success: false, message: "帳號已被註冊" });
@@ -97,7 +124,18 @@ app.post('/register', async (req, res) => {
     );
     const user = result.rows[0];
     const token = await issueToken(user.user_id);
-    res.json({ success: true, user: { ...user, token } });
+    // email 是選填欄位，有填才需要驗證；沒填就跳過，不擋註冊流程本身。
+    // issueEmailVerificationCode 內部寄信本身是 fire-and-forget，這裡 await 只是等寫入
+    // 驗證碼這兩個很快的 DB 查詢完成，才能把 expiresAt 一起回給前端顯示倒數計時
+    let emailVerificationExpiresAt = null;
+    if (email) {
+      try {
+        emailVerificationExpiresAt = await issueEmailVerificationCode(user.user_id, email);
+      } catch (err) {
+        console.error('[Email 驗證] 註冊時發送驗證碼失敗:', err.message);
+      }
+    }
+    res.json({ success: true, user: { ...user, token }, emailVerificationExpiresAt });
   } catch (err) { console.error("Register Error:", err.message); res.status(500).json({ success: false, message: "伺服器錯誤" }); }
 });
 
@@ -139,38 +177,74 @@ app.post('/auth/google', async (req, res) => {
       });
     }
 
-    // 首次使用此 Google 帳號登入，資料庫尚缺角色與電話，交由前端導向補齊資料頁面
-    res.json({ success: true, needsProfile: true, googleId, email, suggestedName });
+    // 沒有 google_id 對應的帳號時，如果 Google 已驗證這個 email（不是使用者自己填的、
+    // 是 Google 端確認過擁有權的），才進一步比對是否有帳密註冊、且「自己也驗證過」同一個
+    // email 的帳號——兩邊都驗證過才能安全地自動綁定登入，避免有人搶先拿別人的 email
+    // 帳密註冊、等對方 Google 登入時被誤導綁到那個帳號
+    if (email && payload.email_verified) {
+      const localMatch = await db.query(
+        'SELECT * FROM users WHERE email = $1 AND email_verified = true',
+        [email]
+      );
+      if (localMatch.rows.length > 0) {
+        const user = localMatch.rows[0];
+        await db.query('UPDATE users SET google_id = $1 WHERE user_id = $2', [googleId, user.user_id]);
+        const token = await issueToken(user.user_id);
+        return res.json({
+          success: true,
+          user: { id: user.user_id, username: user.username, role: user.role, full_name: user.full_name, phone: user.phone, token },
+        });
+      }
+    }
+
+    // 首次使用此 Google 帳號登入，資料庫尚缺角色與電話，交由前端導向補齊資料頁面。
+    // 這裡改帶回 idToken 本身（而不是拆開的 googleId/email 字串），讓補齊資料時能重新驗證，
+    // 不能讓 client 自己宣稱任意 googleId/email 就建立帳號
+    res.json({ success: true, needsProfile: true, idToken, suggestedName });
   } catch (err) {
     console.error("Google 憑證驗證失敗:", err.message);
     res.status(401).json({ success: false, message: "Google 憑證驗證失敗" });
   }
 });
 
-// 首次使用 Google 登入的新使用者，於此補齊角色與聯絡電話後建立帳號
+// 首次使用 Google 登入的新使用者，於此補齊角色與聯絡電話後建立帳號。
+// 不信任 client 傳來的 googleId/email 字串（那樣的話任何人都能捏造 email 建立一個
+// 看起來像已驗證的帳號），改成重新驗證 idToken 本身，跟 /auth/google 用同一套驗證方式
 app.post('/auth/complete-google-profile', async (req, res) => {
-  const { googleId, email, full_name, phone, role } = req.body;
-  if (!googleId || !full_name || !phone || !role) {
+  const { idToken, full_name, phone, role } = req.body;
+  if (!idToken || !full_name || !phone || !role) {
     return res.status(400).json({ success: false, message: "資料不完整" });
   }
 
   try {
+    const ticket = await googleClient.verifyIdToken({ idToken, audience: GOOGLE_CLIENT_IDS });
+    const payload = ticket.getPayload();
+    const googleId = payload.sub;
+    const email = payload.email || null;
+
     const dup = await db.query('SELECT 1 FROM users WHERE google_id = $1', [googleId]);
     if (dup.rows.length > 0) return res.status(400).json({ success: false, message: "此 Google 帳號已註冊過" });
 
+    // Google 已經驗證過這個 email 的擁有權，不需要再走一次自家驗證碼流程
+    const emailVerified = !!(email && payload.email_verified);
+
     const username = `google_${googleId.slice(-12)}`;
     const result = await db.query(
-      `INSERT INTO users (full_name, username, password_hash, phone, email, role, google_id, auth_provider)
-       VALUES ($1, $2, NULL, $3, $4, $5, $6, 'google')
+      `INSERT INTO users (full_name, username, password_hash, phone, email, role, google_id, email_verified)
+       VALUES ($1, $2, NULL, $3, $4, $5, $6, $7)
        RETURNING user_id AS id, full_name, username, role, phone`,
-      [full_name, username, phone, email || null, role, googleId]
+      [full_name, username, phone, email, role, googleId, emailVerified]
     );
     const user = result.rows[0];
     const token = await issueToken(user.id);
     res.json({ success: true, user: { ...user, token } });
   } catch (err) {
+    // partial unique index（users_verified_email_idx）衝突：這個 email 已經被另一個已驗證帳號使用
+    if (err.code === '23505') {
+      return res.status(409).json({ success: false, message: "這個信箱已被其他帳號驗證使用" });
+    }
     console.error("補齊 Google 資料失敗:", err.message);
-    res.status(500).json({ success: false, message: "伺服器錯誤" });
+    res.status(500).json({ success: false, message: "Google 憑證驗證失敗或伺服器錯誤" });
   }
 });
 
@@ -199,6 +273,9 @@ app.put('/update-email', requireAuth, requireSelf('userId'), async (req, res) =>
   if (!userId || !newEmail || !password) {
     return res.status(400).json({ success: false, message: "資料不完整" });
   }
+  if (!EMAIL_FORMAT_REGEX.test(newEmail)) {
+    return res.status(400).json({ success: false, message: "電子郵件格式錯誤" });
+  }
   try {
     const userRes = await db.query('SELECT password_hash FROM users WHERE user_id = $1', [userId]);
     if (userRes.rows.length === 0) return res.status(404).json({ success: false, message: "找不到該使用者" });
@@ -211,13 +288,69 @@ app.put('/update-email', requireAuth, requireSelf('userId'), async (req, res) =>
     const isMatch = await bcrypt.compare(password, password_hash);
     if (!isMatch) return res.status(401).json({ success: false, message: "密碼驗證失敗，請輸入正確的密碼" });
 
+    // 新 email 還沒驗證過，不能沿用舊 email 的已驗證狀態
+    const trimmedEmail = String(newEmail).trim();
     const result = await db.query(
-      'UPDATE users SET email = $1 WHERE user_id = $2 RETURNING user_id, email',
-      [String(newEmail).trim(), userId]
+      'UPDATE users SET email = $1, email_verified = false WHERE user_id = $2 RETURNING user_id, email',
+      [trimmedEmail, userId]
     );
-    res.json({ success: true, message: "Email 更新成功", user: result.rows[0] });
+    // email 本身已經更新成功，就算驗證碼發送失敗也不該讓這支 API 回傳失敗，只記 log
+    let emailVerificationExpiresAt = null;
+    try {
+      emailVerificationExpiresAt = await issueEmailVerificationCode(userId, trimmedEmail);
+    } catch (err) {
+      console.error('[Email 驗證] 改信箱後發送驗證碼失敗:', err.message);
+    }
+    res.json({
+      success: true,
+      message: "Email 更新成功，請至新信箱完成驗證",
+      user: result.rows[0],
+      emailVerificationExpiresAt,
+    });
   } catch (err) {
     console.error("Update Email Error:", err.message);
+    res.status(500).json({ success: false, message: "伺服器錯誤" });
+  }
+});
+
+// 輸入收到的 6 碼驗證碼完成信箱驗證
+app.post('/verify-email', requireAuth, async (req, res) => {
+  const { code } = req.body;
+  if (!code) return res.status(400).json({ success: false, message: "請輸入驗證碼" });
+
+  try {
+    const result = await db.query(
+      'SELECT id, email FROM email_verification_codes WHERE user_id = $1 AND code = $2 AND expires_at > now()',
+      [req.authUserId, String(code).trim()]
+    );
+    if (result.rows.length === 0) {
+      return res.status(400).json({ success: false, message: "驗證碼錯誤或已過期" });
+    }
+
+    await db.query('UPDATE users SET email_verified = true WHERE user_id = $1', [req.authUserId]);
+    await db.query('DELETE FROM email_verification_codes WHERE user_id = $1', [req.authUserId]);
+    res.json({ success: true, message: "信箱驗證成功" });
+  } catch (err) {
+    // partial unique index（users_verified_email_idx）衝突：這個信箱已經被另一個已驗證帳號使用
+    if (err.code === '23505') {
+      return res.status(409).json({ success: false, message: "這個信箱已被其他帳號驗證使用" });
+    }
+    console.error("Verify Email Error:", err.message);
+    res.status(500).json({ success: false, message: "伺服器錯誤" });
+  }
+});
+
+// 沒收到驗證信或驗證碼過期時，重新寄送一組新的
+app.post('/resend-verification-email', requireAuth, async (req, res) => {
+  try {
+    const userRes = await db.query('SELECT email FROM users WHERE user_id = $1', [req.authUserId]);
+    const email = userRes.rows[0]?.email;
+    if (!email) return res.status(400).json({ success: false, message: "此帳號尚未設定 email" });
+
+    const emailVerificationExpiresAt = await issueEmailVerificationCode(req.authUserId, email);
+    res.json({ success: true, message: "驗證碼已重新寄送", emailVerificationExpiresAt });
+  } catch (err) {
+    console.error("Resend Verification Error:", err.message);
     res.status(500).json({ success: false, message: "伺服器錯誤" });
   }
 });
@@ -254,7 +387,7 @@ app.get('/user-profile/:userId', requireAuth, requireSelf('userId', 'params'), a
   const { userId } = req.params;
   try {
     const result = await db.query(
-      'SELECT user_id, full_name, username, email, phone, role FROM users WHERE user_id = $1',
+      'SELECT user_id, full_name, username, email, email_verified, phone, role FROM users WHERE user_id = $1',
       [userId]
     );
     if (result.rows.length === 0) return res.status(404).json({ success: false, message: "找不到該使用者" });
@@ -290,7 +423,7 @@ app.post('/bind-direct', requireAuth, requireSelf('myId'), async (req, res) => {
     const users = userRes.rows;
     let blind_id = users.find(u => u.role === 'blind')?.user_id;
     let caregiver_id = users.find(u => u.role === 'caregiver')?.user_id;
-    await db.query(`INSERT INTO connections (blind_id, caregiver_id, status, requester_id) VALUES ($1, $2, 'accepted', $3)`, [blind_id, caregiver_id, myId]);
+    await db.query(`INSERT INTO connections (blind_id, caregiver_id, status) VALUES ($1, $2, 'accepted')`, [blind_id, caregiver_id]);
     res.json({ success: true, message: "綁定成功" });
   } catch (err) { console.error("Bind Error:", err.message); res.status(500).json({ success: false, message: "資料庫錯誤" }); }
 });
@@ -458,10 +591,41 @@ function pickClosest(analysis) {
 // 所以要先從 analysis 裡把它獨立出來，剩下的物體才拿去比最近
 const TRAFFIC_LIGHT_LABELS = new Set(['紅燈', '綠燈']);
 
-// 從左/中/右三區的可行走分數中，排除掉障礙物所在的區域（若有），挑分數最高的一區當建議行走方向
+// SegFormer 行走方向決策：
+// - 沒有障礙物時，不使用 walkableScores 強制推薦方向；正常直行不需要額外播報。
+//   若正前方缺乏明顯人行道，交由 sidewalkDirection 提醒往左/右的人行道移動。
+// - 有障礙物時，先排除障礙物所在區，再比較剩餘區域。
+// - 候選區域分數太低，或最佳與次佳差距太小時，不硬給方向，避免模型不確定卻誤導使用者。
+const WALKABLE_MIN_SCORE = 0.15;
+const DIRECTION_MIN_GAP = 0.08;
+
 function pickRecommendedZone(walkableScores, excludeZone) {
-    const zones = ['left', 'middle', 'right'].filter((z) => z !== excludeZone);
-    return zones.reduce((best, z) => (walkableScores[z] > walkableScores[best] ? z : best), zones[0]);
+    if (!walkableScores || !excludeZone) return null;
+
+    const zones = ['left', 'middle', 'right']
+        .filter((z) => z !== excludeZone);
+
+    if (zones.length === 0) return null;
+
+    const ranked = zones
+        .map((zone) => ({
+            zone,
+            score: Number(walkableScores[zone] ?? 0),
+        }))
+        .sort((a, b) => b.score - a.score);
+
+    const best = ranked[0];
+    const second = ranked[1];
+
+    if (!best || best.score < WALKABLE_MIN_SCORE) {
+        return null;
+    }
+
+    if (second && (best.score - second.score) < DIRECTION_MIN_GAP) {
+        return null;
+    }
+
+    return best.zone;
 }
 
 // SegFormer 人行道方向建議：正前方沒有明顯人行道時，Python 端會回報左右哪一側有，
@@ -550,6 +714,12 @@ app.post('/analyze', requireAuth, async (req, res) => {
             ? pickClosest(crosswalkObstacleItems).object
             : null;
 
+        const trafficLightName = crosswalkConfirmed && trafficLightItem ? trafficLightItem.object : null;
+
+        // 🔍 後端偵錯日誌：在 res.status(200) 回傳給 App 前，先在控制台印出結果，方便確認
+        // Node 有沒有成功收到並解析 Python 那邊回傳的辨識結果
+        console.log(`[Analyze] 使用者: ${userId} | 成功解析 -> label: "${label}", trafficLight: "${trafficLightName}"`);
+
         res.status(200).json({
             success: true,
             label,
@@ -557,7 +727,7 @@ app.post('/analyze', requireAuth, async (req, res) => {
             recommendedZone,
             // 紅綠燈提示是「已確認前方有斑馬線」流程下的一步，還沒連續確認前不提前播報燈號，
             // 避免跟一般障礙物提示同時搶播報名額
-            trafficLight: crosswalkConfirmed && trafficLightItem ? trafficLightItem.object : null,
+            trafficLight: trafficLightName,
             crosswalkInMiddle: crosswalkConfirmed,
             crosswalkObstacle,
             terrainDetected: !!terrainDetected,

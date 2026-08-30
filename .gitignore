@@ -4,3 +4,4 @@ node_modules/
 secrets/
 *_log.txt
 *_log_new.txt
+*.log
