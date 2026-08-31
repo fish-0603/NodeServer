@@ -119,18 +119,18 @@ app.post('/register', async (req, res) => {
     if (userCheck.rows.length > 0) return res.status(400).json({ success: false, message: "帳號已被註冊" });
     const hashedPassword = await bcrypt.hash(password, 10);
     const result = await db.query(
-      `INSERT INTO users (full_name, username, password_hash, phone, email, role) VALUES ($1, $2, $3, $4, $5, $6) RETURNING user_id, full_name, username, role`,
+      `INSERT INTO users (full_name, username, password_hash, phone, email, role) VALUES ($1, $2, $3, $4, $5, $6) RETURNING user_id AS id, full_name, username, role`,
       [full_name, username, hashedPassword, phone, email || null, role]
     );
     const user = result.rows[0];
-    const token = await issueToken(user.user_id);
+    const token = await issueToken(user.id);
     // email 是選填欄位，有填才需要驗證；沒填就跳過，不擋註冊流程本身。
     // issueEmailVerificationCode 內部寄信本身是 fire-and-forget，這裡 await 只是等寫入
     // 驗證碼這兩個很快的 DB 查詢完成，才能把 expiresAt 一起回給前端顯示倒數計時
     let emailVerificationExpiresAt = null;
     if (email) {
       try {
-        emailVerificationExpiresAt = await issueEmailVerificationCode(user.user_id, email);
+        emailVerificationExpiresAt = await issueEmailVerificationCode(user.id, email);
       } catch (err) {
         console.error('[Email 驗證] 註冊時發送驗證碼失敗:', err.message);
       }
@@ -557,7 +557,7 @@ app.get('/sos-history/:userId', requireAuth, requireSelf('userId', 'params'), as
        FROM sos_events e
        JOIN users u ON e.user_id = u.user_id
        JOIN connections c ON e.user_id = c.blind_id
-       WHERE c.caregiver_id = $1
+       WHERE c.caregiver_id = $1 AND e.created_at >= c.created_at
        ORDER BY e.created_at DESC`,
       [userId]
     );
