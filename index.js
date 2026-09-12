@@ -267,27 +267,16 @@ app.put('/update-name', requireAuth, requireSelf('userId'), async (req, res) => 
   }
 });
 
-// 更新 Email：需先用密碼驗證身分（Google 登入帳號沒有 password_hash，無法用這個方式驗證）
+// 更新 Email：不需密碼，直接改信箱後寄驗證碼到新信箱完成驗證
 app.put('/update-email', requireAuth, requireSelf('userId'), async (req, res) => {
-  const { userId, newEmail, password } = req.body;
-  if (!userId || !newEmail || !password) {
+  const { userId, newEmail } = req.body;
+  if (!userId || !newEmail) {
     return res.status(400).json({ success: false, message: "資料不完整" });
   }
   if (!EMAIL_FORMAT_REGEX.test(newEmail)) {
     return res.status(400).json({ success: false, message: "電子郵件格式錯誤" });
   }
   try {
-    const userRes = await db.query('SELECT password_hash FROM users WHERE user_id = $1', [userId]);
-    if (userRes.rows.length === 0) return res.status(404).json({ success: false, message: "找不到該使用者" });
-
-    const { password_hash } = userRes.rows[0];
-    if (!password_hash) {
-      return res.status(400).json({ success: false, message: "此帳號使用 Google 登入，無法透過密碼驗證更新 Email" });
-    }
-
-    const isMatch = await bcrypt.compare(password, password_hash);
-    if (!isMatch) return res.status(401).json({ success: false, message: "密碼驗證失敗，請輸入正確的密碼" });
-
     // 新 email 還沒驗證過，不能沿用舊 email 的已驗證狀態
     const trimmedEmail = String(newEmail).trim();
     const result = await db.query(
@@ -391,7 +380,16 @@ app.get('/user-profile/:userId', requireAuth, requireSelf('userId', 'params'), a
       [userId]
     );
     if (result.rows.length === 0) return res.status(404).json({ success: false, message: "找不到該使用者" });
-    res.json({ success: true, user: result.rows[0] });
+
+    // 如果還有尚未過期的驗證碼在等，一併回傳到期時間，讓驗證頁一進頁就能顯示倒數，
+    // 不用等使用者按「重新寄送」才知道
+    const pendingCode = await db.query(
+      'SELECT expires_at FROM email_verification_codes WHERE user_id = $1 AND expires_at > now()',
+      [userId]
+    );
+    const emailVerificationExpiresAt = pendingCode.rows[0]?.expires_at || null;
+
+    res.json({ success: true, user: result.rows[0], emailVerificationExpiresAt });
   } catch (err) {
     console.error("Get User Profile Error:", err.message);
     res.status(500).json({ success: false, message: "伺服器錯誤" });
@@ -591,37 +589,91 @@ function pickClosest(analysis) {
 // 所以要先從 analysis 裡把它獨立出來，剩下的物體才拿去比最近
 const TRAFFIC_LIGHT_LABELS = new Set(['紅燈', '綠燈']);
 
-// SegFormer 行走方向決策：
-// - 沒有障礙物時，不使用 walkableScores 強制推薦方向；正常直行不需要額外播報。
-//   若正前方缺乏明顯人行道，交由 sidewalkDirection 提醒往左/右的人行道移動。
-// - 有障礙物時，先排除障礙物所在區，再比較剩餘區域。
-// - 候選區域分數太低，或最佳與次佳差距太小時，不硬給方向，避免模型不確定卻誤導使用者。
-const WALKABLE_MIN_SCORE = 0.15;
-const DIRECTION_MIN_GAP = 0.08;
+// YOLO × SegFormer 行走安全融合：
+// SegFormer 提供左／中／右區域本身的行走安全分數，YOLO 提供各區域目前是否存在
+// 實體障礙物及其距離。依障礙物距離降低所在區域的安全分數，再決定是否需要轉向。
 
-function pickRecommendedZone(walkableScores, excludeZone) {
-    if (!walkableScores || !excludeZone) return null;
+// 最高分低於此門檻時，不提供方向，避免在整體都不理想的場景硬選一邊。
+// Python 端 road 權重為 0.5，因此 0.55 可避免「純 road」輕易成為推薦方向。
+const WALKABLE_MIN_SCORE = 0.55;
+// 最佳方向與第二名差距太小時，不提供方向，降低左右來回跳動。
+const DIRECTION_MIN_GAP = 0.12;
+// 正前方沒有近／中距離障礙，而且 middle 仍高於此值時，維持直行、不額外播方向。
+const CENTER_KEEP_MIN_SCORE = 0.60;
 
-    const zones = ['left', 'middle', 'right']
-        .filter((z) => z !== excludeZone);
+function getObstacleSafetyFactor(item) {
+    if (!item || !item.distance) return 1.0;
+    if (item.distance.startsWith('近')) return 0.15;
+    if (item.distance.startsWith('中')) return 0.45;
+    // 遠距離障礙只稍微降低該方向優先程度，不會因為遠方有人或車就太早要求使用者轉向
+    return 0.75;
+}
 
-    if (zones.length === 0) return null;
+function buildFusedWalkableScores(walkableScores, obstacles) {
+    if (!walkableScores) return null;
 
-    const ranked = zones
+    const fusedScores = {
+        left: Number(walkableScores.left ?? 0),
+        middle: Number(walkableScores.middle ?? 0),
+        right: Number(walkableScores.right ?? 0),
+    };
+
+    // 同一區如果同時有多個障礙物，只採用最嚴格的安全係數，不把係數連乘，
+    // 避免多個 YOLO 偵測框把分數不合理地壓到接近 0
+    const zoneFactors = { left: 1.0, middle: 1.0, right: 1.0 };
+
+    for (const item of obstacles || []) {
+        const zone = item.zone;
+        if (!['left', 'middle', 'right'].includes(zone)) continue;
+        const factor = getObstacleSafetyFactor(item);
+        zoneFactors[zone] = Math.min(zoneFactors[zone], factor);
+    }
+
+    for (const zone of ['left', 'middle', 'right']) {
+        fusedScores[zone] = fusedScores[zone] * zoneFactors[zone];
+    }
+
+    return fusedScores;
+}
+
+function pickRecommendedZone(fusedScores, obstacleItems) {
+    if (!fusedScores) return null;
+
+    // 只有 middle 出現近／中距離障礙，才視為目前直行方向受到明顯阻擋。
+    // 遠方障礙物仍然會降低 middle 的融合分數，但不會直接逼使用者提早轉向
+    const middleHasRelevantObstacle = (obstacleItems || []).some((item) => {
+        if (item.zone !== 'middle' || !item.distance) return false;
+        return item.distance.startsWith('近') || item.distance.startsWith('中');
+    });
+
+    // 正前方沒有近／中距離障礙，且 middle 本身仍具有足夠安全性 → 維持直行
+    if (!middleHasRelevantObstacle && fusedScores.middle >= CENTER_KEEP_MIN_SCORE) {
+        return null;
+    }
+
+    // middle 有明顯障礙，或 middle 本身安全性不足 → 比較融合後左／中／右安全程度
+    const ranked = ['left', 'middle', 'right']
         .map((zone) => ({
             zone,
-            score: Number(walkableScores[zone] ?? 0),
+            score: Number(fusedScores[zone] ?? 0),
         }))
         .sort((a, b) => b.score - a.score);
 
     const best = ranked[0];
     const second = ranked[1];
 
+    // 所有方向都不夠安全，不為了「一定要給方向」而亂選
     if (!best || best.score < WALKABLE_MIN_SCORE) {
         return null;
     }
 
+    // 最佳與第二名差距太小，SegFormer + YOLO 沒有足夠證據判斷其中一邊明顯更安全
     if (second && (best.score - second.score) < DIRECTION_MIN_GAP) {
+        return null;
+    }
+
+    // middle 最佳代表繼續直行即可，不需要播「往中間」
+    if (best.zone === 'middle') {
         return null;
     }
 
@@ -679,7 +731,8 @@ app.post('/analyze', requireAuth, async (req, res) => {
                 success: true,
                 label: null,
                 zone: null,
-                recommendedZone: walkableScores ? pickRecommendedZone(walkableScores, null) : null,
+                // 沒有障礙物時，不需要每次都硬推薦一個方向
+                recommendedZone: null,
                 trafficLight: null,
                 crosswalkInMiddle: crosswalkConfirmed,
                 // 沒有偵測到任何物體，斑馬線上自然也不會有障礙物
@@ -703,8 +756,13 @@ app.post('/analyze', requireAuth, async (req, res) => {
             zone = closest.zone;
         }
 
-        // 建議行走方向：排除掉障礙物所在區，從剩下的區域挑可行走分數最高的一區
-        const recommendedZone = walkableScores ? pickRecommendedZone(walkableScores, zone) : null;
+        // 建議行走方向：SegFormer 基礎分數融合 YOLO 障礙物距離後，再決定是否需要轉向
+        const fusedWalkableScores = buildFusedWalkableScores(walkableScores, otherItems);
+        const recommendedZone = pickRecommendedZone(fusedWalkableScores, otherItems);
+
+        // Debug：實測階段先保留，方便直接比對 base（SegFormer 原始分數）跟
+        // fused（加入 YOLO 障礙物後的分數）判斷出的 recommendedZone 是否合理
+        console.log(`[Fusion][frame=${frameId}]`, { base: walkableScores, fused: fusedWalkableScores, recommendedZone });
 
         // 斑馬線上是否有障礙物：只採信 Python 端算出跟斑馬線像素區域有實際重疊的物體（onCrosswalk），
         // 不再用「同一個中間分區」這種粗略判斷，避免把斑馬線兩側、但其實沒踩在線上的東西也算進去。
