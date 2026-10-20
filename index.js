@@ -267,6 +267,29 @@ app.put('/update-name', requireAuth, requireSelf('userId'), async (req, res) => 
   }
 });
 
+// App 設定頁的「編輯個人資料」功能會呼叫此路由更新手機號碼
+app.put('/update-phone', requireAuth, requireSelf('userId'), async (req, res) => {
+  const { userId, phone } = req.body;
+  const trimmedPhone = String(phone || '').trim();
+  if (!userId || !trimmedPhone) {
+    return res.status(400).json({ success: false, message: "資料不完整" });
+  }
+  if (!/^09\d{8}$/.test(trimmedPhone)) {
+    return res.status(400).json({ success: false, message: "電話格式錯誤 (需為 09xxxxxxxx)" });
+  }
+  try {
+    const result = await db.query(
+      'UPDATE users SET phone = $1 WHERE user_id = $2 RETURNING user_id, phone',
+      [trimmedPhone, userId]
+    );
+    if (result.rows.length === 0) return res.status(404).json({ success: false, message: "找不到使用者" });
+    res.json({ success: true, user: result.rows[0] });
+  } catch (err) {
+    console.error("Update Phone Error:", err.message);
+    res.status(500).json({ success: false, message: "伺服器錯誤" });
+  }
+});
+
 // 更新 Email：不需密碼，直接改信箱後寄驗證碼到新信箱完成驗證
 app.put('/update-email', requireAuth, requireSelf('userId'), async (req, res) => {
   const { userId, newEmail } = req.body;
@@ -279,6 +302,17 @@ app.put('/update-email', requireAuth, requireSelf('userId'), async (req, res) =>
   try {
     // 新 email 還沒驗證過，不能沿用舊 email 的已驗證狀態
     const trimmedEmail = String(newEmail).trim();
+
+    // 先擋掉已被其他帳號驗證過的信箱，避免改成功後才寄驗證信到別人信箱、
+    // 且要等使用者按驗證時才撞到 users_verified_email_idx 才發現重複
+    const dup = await db.query(
+      'SELECT 1 FROM users WHERE email = $1 AND email_verified = true AND user_id != $2',
+      [trimmedEmail, userId]
+    );
+    if (dup.rows.length > 0) {
+      return res.status(409).json({ success: false, message: "這個信箱已被其他帳號驗證使用" });
+    }
+
     const result = await db.query(
       'UPDATE users SET email = $1, email_verified = false WHERE user_id = $2 RETURNING user_id, email',
       [trimmedEmail, userId]
@@ -376,7 +410,7 @@ app.get('/user-profile/:userId', requireAuth, requireSelf('userId', 'params'), a
   const { userId } = req.params;
   try {
     const result = await db.query(
-      'SELECT user_id, full_name, username, email, email_verified, phone, role FROM users WHERE user_id = $1',
+      'SELECT user_id, full_name, username, email, email_verified, phone, role, (password_hash IS NOT NULL) AS has_password FROM users WHERE user_id = $1',
       [userId]
     );
     if (result.rows.length === 0) return res.status(404).json({ success: false, message: "找不到該使用者" });
@@ -594,10 +628,9 @@ const TRAFFIC_LIGHT_LABELS = new Set(['紅燈', '綠燈']);
 // 實體障礙物及其距離。依障礙物距離降低所在區域的安全分數，再決定是否需要轉向。
 
 // 最高分低於此門檻時，不提供方向，避免在整體都不理想的場景硬選一邊。
-// Python 端 road 權重為 0.5，因此 0.55 可避免「純 road」輕易成為推薦方向。
-const WALKABLE_MIN_SCORE = 0.55;
+const WALKABLE_MIN_SCORE = 0.45;
 // 最佳方向與第二名差距太小時，不提供方向，降低左右來回跳動。
-const DIRECTION_MIN_GAP = 0.12;
+const DIRECTION_MIN_GAP = 0.08;
 // 正前方沒有近／中距離障礙，而且 middle 仍高於此值時，維持直行、不額外播方向。
 const CENTER_KEEP_MIN_SCORE = 0.60;
 
@@ -694,7 +727,7 @@ function buildTerrainMessage(sidewalkDirection) {
 // 單一幀的雜訊（反光、遮擋、拍攝角度）就可能讓某一幀誤判有/沒有斑馬線。
 // App 端每 5 秒呼叫一次 /analyze，這裡用登入者 id 追蹤連續命中次數；只要斷一次就整個歸零，
 // 不是容錯的滑動視窗，要重新累積滿才會再次判定「前方確定有斑馬線」
-const CROSSWALK_CONFIRM_STREAK = 3; // 約 6 秒（App 端 2 秒拍一次 * 3）持續偵測到才算數
+const CROSSWALK_CONFIRM_STREAK = 2; // 約 10 秒（App 端 5 秒拍一次 * 2）持續偵測到才算數；原本 3 次要等約 15 秒，路口等太久
 const crosswalkStreaks = new Map(); // userId -> 目前連續命中次數
 
 function updateCrosswalkStreak(userId, crosswalkAhead) {
@@ -706,7 +739,8 @@ function updateCrosswalkStreak(userId, crosswalkAhead) {
 app.post('/analyze', requireAuth, async (req, res) => {
     // frameId/captureTime 只是原樣轉發給 Python 用來在 log 裡標記「這是哪一張照片」，
     // 方便事後對照除錯，App 端自己算辨識結果會不會過期用的是本地時間，不依賴這裡的回傳值
-    const { image, frameId, captureTime } = req.body;
+    // focal35mm 是 App 從照片 EXIF 讀出的 35mm 等效焦距，原樣轉給 Python 換算距離用，沒有就是 null
+    const { image, frameId, captureTime, focal35mm } = req.body;
     // 用已驗證的登入者 id（不是 client 帶的 body.userId），斑馬線連續 frame 計數才不會被亂帶的 userId 污染
     const userId = req.authUserId;
 
@@ -718,7 +752,7 @@ app.post('/analyze', requireAuth, async (req, res) => {
         // 將前端傳來的 base64 圖片轉發給 Python AI 服務進行辨識
         // 注意：Python 端(YOLO+SegFormer)回傳的是 { objects: [...], analysis: [{object, distance, distance_m, ratio, zone, onCrosswalk}, ...],
         // walkableScores: {left, middle, right}, crosswalkAhead, terrainDetected, isBlackFrame }
-        const aiResponse = await axios.post(PYTHON_AI_URL, { image, userId, frameId, captureTime }, { timeout: 30000 });
+        const aiResponse = await axios.post(PYTHON_AI_URL, { image, userId, frameId, captureTime, focal35mm }, { timeout: 30000 });
         const { analysis, walkableScores, crosswalkAhead, terrainDetected, isBlackFrame, sidewalkDirection } = aiResponse.data;
 
         // 斑馬線流程：SegFormer 判斷前方 ROI 有足夠面積的斑馬線 → 連續數個 frame 都存在才確認

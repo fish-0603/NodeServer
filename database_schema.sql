@@ -1,8 +1,9 @@
 -- SmartGuide 資料庫完整結構
--- 從目前正在使用的 App 資料庫 dump 出來，包含六個 migrations 的異動
+-- 從目前正在使用的 App 資料庫 dump 出來，已包含 migrations 001～009 的全部異動
 -- （001 新增 Google 登入欄位、002 補上 CASCADE 刪除規則、003 新增 auth_tokens、
 -- 　004 刪除未使用的 alert_logs、005 刪除未使用的 hardware_logs、
--- 　006 刪除沒有任何路由讀取過的 vision_logs）
+-- 　006 刪除沒有任何路由讀取過的 vision_logs、007 新增 email 驗證機制、
+-- 　008 刪除未使用的 users.auth_provider、009 刪除重複的 connections.requester_id）
 --
 -- 下載這個 repo 的人可以這樣建立一模一樣的資料庫：
 --
@@ -11,8 +12,12 @@
 --   2. 對這個空資料庫執行這份檔案
 --        psql -U postgres -d App -f database_schema.sql
 --
+-- 用這份檔案建立的資料庫已經是 009 之後的狀態，不需要再執行 migrations/ 裡的 001～009；
+-- 之後新增的 010 以後的 migration 才需要手動執行。
+--
 -- 之後有新的欄位異動，請在 migrations/ 資料夾新增一支新的 SQL 檔案，
 -- 不要直接改這份檔案（這份是「初始建置用」，不是持續維護的 migration）。
+
 
 CREATE TABLE public.auth_tokens (
     token text NOT NULL,
@@ -25,7 +30,6 @@ CREATE TABLE public.connections (
     blind_id integer,
     caregiver_id integer,
     status character varying(20) DEFAULT 'pending'::character varying,
-    requester_id integer,
     created_at timestamp without time zone DEFAULT CURRENT_TIMESTAMP,
     is_emergency boolean DEFAULT false
 );
@@ -39,6 +43,25 @@ CREATE SEQUENCE public.connections_id_seq
     CACHE 1;
 
 ALTER SEQUENCE public.connections_id_seq OWNED BY public.connections.id;
+
+CREATE TABLE public.email_verification_codes (
+    id integer NOT NULL,
+    user_id integer NOT NULL,
+    email text NOT NULL,
+    code text NOT NULL,
+    expires_at timestamp without time zone NOT NULL,
+    created_at timestamp without time zone DEFAULT now() NOT NULL
+);
+
+CREATE SEQUENCE public.email_verification_codes_id_seq
+    AS integer
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+ALTER SEQUENCE public.email_verification_codes_id_seq OWNED BY public.email_verification_codes.id;
 
 CREATE TABLE public.sos_events (
     id integer NOT NULL,
@@ -70,7 +93,7 @@ CREATE TABLE public.users (
     role character varying(20) DEFAULT 'blind'::character varying,
     created_at timestamp without time zone DEFAULT CURRENT_TIMESTAMP,
     google_id character varying(255),
-    auth_provider character varying(20) DEFAULT 'local'::character varying NOT NULL,
+    email_verified boolean DEFAULT false NOT NULL,
     CONSTRAINT check_phone_format CHECK (((phone)::text ~ '^09[0-9]{8}$'::text))
 );
 
@@ -85,7 +108,11 @@ CREATE SEQUENCE public.users_user_id_seq
 ALTER SEQUENCE public.users_user_id_seq OWNED BY public.users.user_id;
 
 ALTER TABLE ONLY public.connections ALTER COLUMN id SET DEFAULT nextval('public.connections_id_seq'::regclass);
+
+ALTER TABLE ONLY public.email_verification_codes ALTER COLUMN id SET DEFAULT nextval('public.email_verification_codes_id_seq'::regclass);
+
 ALTER TABLE ONLY public.sos_events ALTER COLUMN id SET DEFAULT nextval('public.sos_events_id_seq'::regclass);
+
 ALTER TABLE ONLY public.users ALTER COLUMN user_id SET DEFAULT nextval('public.users_user_id_seq'::regclass);
 
 ALTER TABLE ONLY public.auth_tokens
@@ -96,6 +123,9 @@ ALTER TABLE ONLY public.connections
 
 ALTER TABLE ONLY public.connections
     ADD CONSTRAINT connections_pkey PRIMARY KEY (id);
+
+ALTER TABLE ONLY public.email_verification_codes
+    ADD CONSTRAINT email_verification_codes_pkey PRIMARY KEY (id);
 
 ALTER TABLE ONLY public.sos_events
     ADD CONSTRAINT sos_events_pkey PRIMARY KEY (id);
@@ -111,6 +141,10 @@ ALTER TABLE ONLY public.users
 
 CREATE INDEX auth_tokens_user_id_idx ON public.auth_tokens USING btree (user_id);
 
+CREATE INDEX email_verification_codes_user_id_idx ON public.email_verification_codes USING btree (user_id);
+
+CREATE UNIQUE INDEX users_verified_email_idx ON public.users USING btree (email) WHERE (email_verified = true);
+
 ALTER TABLE ONLY public.auth_tokens
     ADD CONSTRAINT auth_tokens_user_id_fkey FOREIGN KEY (user_id) REFERENCES public.users(user_id) ON DELETE CASCADE;
 
@@ -120,8 +154,8 @@ ALTER TABLE ONLY public.connections
 ALTER TABLE ONLY public.connections
     ADD CONSTRAINT connections_caregiver_id_fkey FOREIGN KEY (caregiver_id) REFERENCES public.users(user_id) ON DELETE CASCADE;
 
-ALTER TABLE ONLY public.connections
-    ADD CONSTRAINT connections_requester_id_fkey FOREIGN KEY (requester_id) REFERENCES public.users(user_id);
+ALTER TABLE ONLY public.email_verification_codes
+    ADD CONSTRAINT email_verification_codes_user_id_fkey FOREIGN KEY (user_id) REFERENCES public.users(user_id) ON DELETE CASCADE;
 
 ALTER TABLE ONLY public.sos_events
     ADD CONSTRAINT sos_events_user_id_fkey FOREIGN KEY (user_id) REFERENCES public.users(user_id) ON DELETE CASCADE;
